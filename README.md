@@ -26,6 +26,7 @@ This project has reached a **stable** status. It is actively maintained with ong
     - [Working with Session Data](#working-with-session-data)
     - [Loading and Saving Sessions](#loading-and-saving-sessions)
     - [Configuring the Session Store](#configuring-the-session-store)
+    - [Migrating Between Session Stores](#migrating-between-session-stores)
     - [Using Custom Session Stores](#using-custom-session-stores)
       - [Using Custom Session Stores (with context.Context)](#using-custom-session-stores-with-contextcontext)
     - [Multiple Sessions per Request](#multiple-sessions-per-request)
@@ -183,6 +184,37 @@ The following session stores supported by third-parties are also available:
 | [rueidisstore](https://github.com/fnoopv/rueidisstore)         | [Redis](https://redis.io/) (using the [rueidis](https://github.com/redis/rueidis) driver) | N | N | Y |
 
 Custom session stores are also supported. Please see below for more information.
+
+### Migrating Between Session Stores
+
+The [`MigratingStore`](https://pkg.go.dev/github.com/alexedwards/scs/v2#MigratingStore) type moves existing sessions from one store to another without logging users out. Configure it with the old (source) store and the new (target) store:
+
+```go
+sessionManager := scs.New()
+sessionManager.Store = scs.NewMigratingStore(memstore.New(), redisstore.New(pool))
+```
+
+Or use the `NewMigrating` convenience function, which does the same thing:
+
+```go
+sessionManager := scs.NewMigrating(memstore.New(), redisstore.New(pool))
+```
+
+Existing sessions are read from the source store and copied to the target store the first time they are used. The session keeps its original token and expiry, so the client's cookie remains valid and no user is logged out. The copy is only considered complete once it can be read back from the target store with the same data; if that fails, the target copy is removed and the request carries on with the session from the source store. A session is only migrated once, even when several requests for the same token arrive concurrently.
+
+While the migration is running, commits, deletes and iteration are applied to both stores so that the two stores stay consistent. Writes made after a rollback go to the source store only.
+
+If you need to abandon the migration, call `Rollback()` on the `MigratingStore`. The source store becomes authoritative again, so partially migrated data in the target store cannot shadow the old sessions.
+
+```go
+sessionManager.Store.(*scs.MigratingStore).Rollback()
+```
+
+The source copies of migrated sessions are deliberately retained so that a rollback does not lose any sessions. Once you are confident that the migration has succeeded, you can stop using the `MigratingStore` and point `SessionManager.Store` at the target store directly, then delete the old data at your leisure.
+
+`HashTokenInStore` must have the same value for the whole duration of a migration, because a session written under one token value cannot be read back using the other.
+
+`Close()` releases the source and target stores. Stores which implement `io.Closer` are closed, and stores which implement `StopCleanup()` have their cleanup goroutine stopped. `MigratingStore` does not start any background goroutines of its own. Requests which are waiting for another request's migration are released when the store is closed.
 
 ### Using Custom Session Stores
 

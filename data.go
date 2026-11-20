@@ -1,6 +1,7 @@
 package scs
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
@@ -39,7 +40,19 @@ type sessionData struct {
 	status   Status
 	token    string
 	values   map[string]interface{}
-	mu       sync.Mutex
+	// migrated indicates that the session was copied from the legacy source
+	// store to the target store during this request. The middleware sends a
+	// session cookie for the migrated session, but does not commit the session
+	// again: the migration write is the only write that a read-only request
+	// makes to the target store.
+	migrated bool
+	// migrationFailed indicates that the session came from the legacy source
+	// store but could not be copied to the target store. The request carries on
+	// with the old session and any updates (including a refreshed idle expiry)
+	// are written to the source store only. No session cookie is added, because
+	// the token has not changed and the client's existing cookie remains valid.
+	migrationFailed bool
+	mu              sync.Mutex
 }
 
 func newSessionData(lifetime, idleTimeout time.Duration) *sessionData {
@@ -83,7 +96,7 @@ func (s *SessionManager) Load(ctx context.Context, token string) (context.Contex
 		return s.addSessionDataToContext(ctx, newSessionData(s.Lifetime, s.IdleTimeout)), nil
 	}
 
-	b, found, err := s.doStoreFind(ctx, token)
+	b, found, fromSource, err := s.doStoreFindForMigration(ctx, token)
 	if err != nil {
 		return nil, err
 	} else if !found {
@@ -121,7 +134,86 @@ func (s *SessionManager) Load(ctx context.Context, token string) (context.Contex
 		sd.status = Modified
 	}
 
+	// If the session was read from the legacy source store of a MigratingStore,
+	// migrate it to the target store before it is used. The session has been
+	// read and decoded in full above, so either the whole session is copied or
+	// nothing is written to the target store.
+	//
+	// The session keeps its token and expiry, which means the client's existing
+	// cookie stays valid. If the migration fails, no cookie is added and the
+	// request carries on with the session from the source store.
+	if fromSource {
+		ctx = s.migrateSession(ctx, sd)
+	}
+
 	return s.addSessionDataToContext(ctx, sd), nil
+}
+
+// migrateSession copies the loaded session data from the source store to the
+// target store. It returns a context which routes subsequent store operations
+// for this request to the source store if the migration did not succeed.
+//
+// On success the session is marked as migrated, so that the response includes
+// a session cookie with the refreshed expiry without writing the session a
+// second time.
+func (s *SessionManager) migrateSession(ctx context.Context, sd *sessionData) context.Context {
+	b, err := s.Codec.Encode(sd.deadline, sd.values)
+	if err != nil {
+		sd.migrationFailed = true
+		return withSourceOnly(ctx)
+	}
+
+	committedB, ok, err := s.doStoreMigrate(ctx, sd.token, b, sd.expiry)
+	if !ok {
+		// The store reported that the session came from an older store but does
+		// not support migration; treat it as an ordinary loaded session.
+		return ctx
+	}
+	if err != nil {
+		sd.migrationFailed = true
+		// The migration write did not happen. Reset the status which Load may
+		// have set for the idle timeout: the old session is used as-is and its
+		// existing cookie stays valid. Any modification made by the handler
+		// afterwards sets the status to Modified again and is still persisted
+		// to the source store.
+		sd.status = Unmodified
+		return withSourceOnly(ctx)
+	}
+
+	// Another request may have migrated this session first. In that case the
+	// target store's copy is authoritative and this request must use it, rather
+	// than carrying on with the data it read from the source store.
+	reused := !bytes.Equal(committedB, b)
+	if reused {
+		deadline, values, err := s.Codec.Decode(committedB)
+		if err != nil {
+			sd.migrationFailed = true
+			return withSourceOnly(ctx)
+		}
+		sd.deadline = deadline
+		sd.values = values
+		sd.expiry = deadline
+		if s.IdleTimeout > 0 {
+			sd.expiry = minTime(deadline, time.Now().Add(s.IdleTimeout).UTC())
+		}
+	}
+
+	sd.migrated = true
+
+	if reused && s.IdleTimeout > 0 {
+		// This request did not write the session, so the refreshed idle expiry
+		// still needs to be committed at the end of the request.
+		sd.status = Modified
+		return ctx
+	}
+
+	// The migration has written the session (including the refreshed idle
+	// expiry, if one is in use) to both stores, so there is nothing left to
+	// commit at the end of the request. Clearing the status keeps read-only
+	// requests from writing the same session to the target store again.
+	sd.status = Unmodified
+
+	return ctx
 }
 
 // Commit saves the session data to the session store and returns the session
@@ -736,6 +828,42 @@ func (s *SessionManager) doStoreFind(ctx context.Context, token string) (b []byt
 		return c.FindCtx(ctx, token)
 	}
 	return s.Store.Find(token)
+}
+
+// doStoreFindForMigration is like doStoreFind, but also reports whether the
+// session was read from a legacy source store which is being migrated away
+// from.
+func (s *SessionManager) doStoreFindForMigration(ctx context.Context, token string) (b []byte, found, fromSource bool, err error) {
+	if s.HashTokenInStore {
+		token = hashToken(token)
+	}
+	if mf, ok := s.Store.(MigrationFinder); ok {
+		return mf.FindForMigration(ctx, token)
+	}
+	c, ok := s.Store.(interface {
+		FindCtx(context.Context, string) ([]byte, bool, error)
+	})
+	if ok {
+		b, found, err = c.FindCtx(ctx, token)
+	} else {
+		b, found, err = s.Store.Find(token)
+	}
+	return b, found, false, err
+}
+
+// doStoreMigrate copies a session to the target store of a MigratingStore. The
+// ok return value is false when the store does not support migration, in which
+// case the caller should treat the session as already current.
+func (s *SessionManager) doStoreMigrate(ctx context.Context, token string, b []byte, expiry time.Time) ([]byte, bool, error) {
+	mc, ok := s.Store.(MigrationCommitter)
+	if !ok {
+		return b, false, nil
+	}
+	if s.HashTokenInStore {
+		token = hashToken(token)
+	}
+	committedB, err := mc.MigrateCtx(ctx, token, b, expiry)
+	return committedB, true, err
 }
 
 func (s *SessionManager) doStoreCommit(ctx context.Context, token string, b []byte, expiry time.Time) (err error) {

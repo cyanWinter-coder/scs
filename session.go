@@ -191,9 +191,35 @@ func (s *SessionManager) commitAndAddSessionCookie(w http.ResponseWriter, r *htt
 		s.AddSessionCookie(ctx, w, token, expiry)
 	case Destroyed:
 		s.AddSessionCookie(ctx, w, "", time.Time{})
+	case Unmodified:
+		// A session which was migrated from the legacy source store to the
+		// target store during this request has already been written and
+		// verified. Return a cookie with its expiry, but do not write the
+		// session a second time.
+		if token, expiry, ok := s.migratedSession(ctx); ok {
+			s.AddSessionCookie(ctx, w, token, expiry)
+		}
 	}
 
 	return nil
+}
+
+// migratedSession reports whether the session was migrated to the target store
+// during this request, along with its token and expiry.
+func (s *SessionManager) migratedSession(ctx context.Context) (string, time.Time, bool) {
+	sd, ok := ctx.Value(s.ContextKey).(*sessionData)
+	if !ok {
+		return "", time.Time{}, false
+	}
+
+	sd.mu.Lock()
+	defer sd.mu.Unlock()
+
+	if !sd.migrated {
+		return "", time.Time{}, false
+	}
+
+	return sd.token, sd.expiry, true
 }
 
 // Deprecated: WriteSessionCookie is a backwards-compatible alias for
