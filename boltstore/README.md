@@ -66,6 +66,34 @@ boltstore.NewWithCleanupInterval(db, 5*time.Minute)
 boltstore.NewWithCleanupInterval(db, 0)
 ```
 
+## Crash Recovery and Startup Repair
+
+Each session is stored as two coordinated records in the Bolt database: a **value record** in the `scs:session` bucket (holding the expiry time and session data) and an **expiry index entry** in the `scs:session:expiry` bucket (holding the expiry time as an ordered key prefix). Every write, renewal and delete updates both records in a single Bolt transaction, so a failed operation never leaves a one-sided record behind.
+
+If the process is killed mid-operation, the two records may temporarily disagree. A query will never return data in this state: `Find` and `All` verify that the value record and the expiry index entry exist and agree, and treat a missing either side as a non-existent session.
+
+To remove the leftover records permanently, call `Repair` once at startup, before the store serves traffic:
+
+```go
+store := boltstore.NewWithCleanupInterval(db, time.Minute)
+
+result, err := store.Repair(ctx)
+if err != nil {
+    // ctx was canceled; already-repaired batches are committed and a later
+    // Repair call resumes the remaining work.
+    log.Fatal(err)
+}
+log.Printf("repaired %d invalid session records", result.Total())
+```
+
+`Repair` removes three kinds of invalid records and reports how many of each it found:
+
+- `OrphanedIndexes` — expiry index entries without a matching value record (ghost sessions)
+- `OrphanedValues` — value records without a matching expiry index entry, including records written by older versions of this package
+- `MalformedValues` — value records too short to contain an expiry prefix
+
+Repair runs in batches, each committed in its own transaction. If the `context.Context` is canceled, Repair stops before starting further batches and returns the counts collected so far together with the context error; committed batches stay in place and calling `Repair` again with a fresh context resumes the work. It is safe to run on an empty database and safe to run repeatedly — a healthy store reports zero repairs and is left unchanged.
+
 ### Terminating the Cleanup Goroutine
 
 It's rare that the cleanup goroutine needs to be terminated --- it is generally intended to be long-lived and run for the lifetime of your application.
