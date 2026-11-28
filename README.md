@@ -277,7 +277,13 @@ err := sessionManager.Iterate(r.Context(), func(ctx context.Context) error {
 	userID := sessionManager.GetInt(ctx, "userID")
 
 	if userID == 4 {
-		return sessionManager.Destroy(ctx)
+		// Destroy stages the deletion. Because Iterate is not backed by an
+		// HTTP request handled by the LoadAndSave middleware, call
+		// CommitDestroy to persist the staged deletion immediately.
+		if err := sessionManager.Destroy(ctx); err != nil {
+			return err
+		}
+		return sessionManager.CommitDestroy(ctx)
 	}
 
 	return nil

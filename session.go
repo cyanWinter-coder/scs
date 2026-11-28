@@ -190,9 +190,45 @@ func (s *SessionManager) commitAndAddSessionCookie(w http.ResponseWriter, r *htt
 
 		s.AddSessionCookie(ctx, w, token, expiry)
 	case Destroyed:
+		// Perform the staged store deletion. Only once it has succeeded is the
+		// client told to drop its cookie, so a failed deletion leaves the old
+		// cookie and store row in place and the error stays observable.
+		if err := s.CommitDestroy(ctx); err != nil {
+			return err
+		}
+
 		s.AddSessionCookie(ctx, w, "", time.Time{})
 	}
 
+	return nil
+}
+
+// CommitDestroy carries out the store deletions that were staged by Destroy
+// (and any MergeSession calls made before it). It is a no-op if the session was
+// never persisted, or if it has already been committed since it was destroyed.
+func (s *SessionManager) CommitDestroy(ctx context.Context) error {
+	sd := s.getSessionDataFromContext(ctx)
+
+	sd.mu.Lock()
+	defer sd.mu.Unlock()
+
+	// Drain any tokens staged by MergeSession as well as the original token.
+	tokens := sd.mergedTokens
+	if sd.originalToken != "" {
+		tokens = append(tokens, sd.originalToken)
+	}
+
+	for _, token := range tokens {
+		if err := s.doStoreDelete(ctx, token); err != nil {
+			// Keep the Destroyed status and staged tokens so the failure remains
+			// observable and the caller can retry; nothing is presented as
+			// persisted.
+			return err
+		}
+	}
+
+	sd.mergedTokens = nil
+	sd.originalToken = ""
 	return nil
 }
 

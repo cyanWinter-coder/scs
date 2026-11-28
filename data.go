@@ -37,9 +37,21 @@ type sessionData struct {
 	deadline time.Time
 	expiry   time.Time
 	status   Status
-	token    string
-	values   map[string]interface{}
-	mu       sync.Mutex
+	// token is the working token for the current request cycle. It is not
+	// guaranteed to exist in the session store until the session data has been
+	// committed successfully.
+	token string
+	// originalToken is the token that existed in the session store when the
+	// session was loaded. It is empty for new sessions, and is removed from the
+	// store only after any replacement token has been committed successfully
+	// (e.g. following a token rotation or a destroy-and-recreate cycle).
+	originalToken string
+	// mergedTokens holds tokens whose data has been merged into this session
+	// during the request cycle. They are removed from the store by Commit only
+	// after the merged data has been persisted successfully.
+	mergedTokens []string
+	values       map[string]interface{}
+	mu           sync.Mutex
 }
 
 func newSessionData(lifetime, idleTimeout time.Duration) *sessionData {
@@ -91,8 +103,9 @@ func (s *SessionManager) Load(ctx context.Context, token string) (context.Contex
 	}
 
 	sd := &sessionData{
-		status: Unmodified,
-		token:  token,
+		status:        Unmodified,
+		token:         token,
+		originalToken: token,
 	}
 
 	sd.deadline, sd.values, err = s.Codec.Decode(b)
@@ -127,6 +140,16 @@ func (s *SessionManager) Load(ctx context.Context, token string) (context.Contex
 // Commit saves the session data to the session store and returns the session
 // token and expiry time.
 //
+// If the session data has already been committed and no modifications have been
+// made since, then Commit is a no-op and the previously committed token and
+// expiry time are returned without writing to the store again.
+//
+// If Commit fails, then no session data or token changes are considered
+// persisted: the session status remains Modified (or Destroyed) and the token
+// held by the request is left unchanged, so the caller can retry or report the
+// error. In particular, a new token is never swapped in until the store commit
+// has succeeded.
+//
 // Most applications will use the LoadAndSave() middleware and will not need to
 // use this method.
 func (s *SessionManager) Commit(ctx context.Context) (string, time.Time, error) {
@@ -135,9 +158,19 @@ func (s *SessionManager) Commit(ctx context.Context) (string, time.Time, error) 
 	sd.mu.Lock()
 	defer sd.mu.Unlock()
 
-	if sd.token == "" {
+	// If nothing has changed since the last successful commit, do not write to
+	// the store again.
+	if sd.status == Committed {
+		return sd.token, sd.expiry, nil
+	}
+
+	// Stage the token in a local variable so that a failed store commit does
+	// not mutate the session data held in the request scope.
+	token := sd.token
+	if token == "" {
 		var err error
-		if sd.token, err = generateToken(); err != nil {
+		token, err = generateToken()
+		if err != nil {
 			return "", time.Time{}, err
 		}
 	}
@@ -147,18 +180,53 @@ func (s *SessionManager) Commit(ctx context.Context) (string, time.Time, error) 
 		return "", time.Time{}, err
 	}
 
-	if err := s.doStoreCommit(ctx, sd.token, b, sd.expiry); err != nil {
+	if err := s.doStoreCommit(ctx, token, b, sd.expiry); err != nil {
+		// Leave the status and the request-scope token untouched so that the
+		// failure remains observable and the change is never presented as
+		// persisted.
 		return "", time.Time{}, err
 	}
 
+	// The replacement token is now safely in the store. Remove the original
+	// token last so that a failure here leaves the client's old cookie and
+	// store row intact; the request still fails rather than silently switching
+	// the client onto the new token.
+	if sd.originalToken != "" && sd.originalToken != token {
+		if err := s.doStoreDelete(ctx, sd.originalToken); err != nil {
+			return "", time.Time{}, err
+		}
+	}
+
+	// Tokens whose data was merged into this session can now be removed as
+	// well. Any failure leaves the request uncommitted so that no merge is
+	// presented as durable when it was not.
+	for _, mergedToken := range sd.mergedTokens {
+		if mergedToken == token {
+			continue
+		}
+		if err := s.doStoreDelete(ctx, mergedToken); err != nil {
+			return "", time.Time{}, err
+		}
+	}
+	sd.mergedTokens = nil
+
+	// Only swap the token in once every store operation has succeeded.
+	sd.token = token
+	sd.originalToken = token
 	sd.status = Committed
 
 	return sd.token, sd.expiry, nil
 }
 
-// Destroy deletes the session data from the session store and sets the session
-// status to Destroyed. Any further operations in the same request cycle will
-// result in a new session being created.
+// Destroy marks the session data for destruction in the session store and sets
+// the session status to Destroyed. Any further operations in the same request
+// cycle will result in a new session being created.
+//
+// The store deletion is staged until the request is committed (either by the
+// LoadAndSave middleware or a manual Commit call). Destroy itself does not
+// touch the store, so it cannot leave the client holding a cookie for a session
+// that has already been removed; if the eventual commit fails, the original
+// session stays intact and the error is returned to the caller.
 //
 // Destroy should only be called once per request cycle, and must be called
 // before the response headers are written.
@@ -168,14 +236,11 @@ func (s *SessionManager) Destroy(ctx context.Context) error {
 	sd.mu.Lock()
 	defer sd.mu.Unlock()
 
-	err := s.doStoreDelete(ctx, sd.token)
-	if err != nil {
-		return err
-	}
-
 	sd.status = Destroyed
 
-	// Reset everything else to defaults.
+	// Reset everything else to defaults. The original token is retained in
+	// originalToken so that the staged deletion can be carried out when the
+	// request is committed.
 	sd.token = ""
 	sd.deadline = time.Now().Add(s.Lifetime).UTC()
 	for key := range sd.values {
@@ -309,7 +374,10 @@ func (s *SessionManager) Keys(ctx context.Context) []string {
 // retaining the current session data. The session lifetime is also reset and
 // the session data status will be set to Modified.
 //
-// The old session token and accompanying data are deleted from the session store.
+// The old session token and accompanying data are deleted from the session
+// store only when the changes are committed, and only after the new token has
+// been committed successfully first. If the commit fails, the original session
+// is left untouched and the client can continue using its existing cookie.
 //
 // To mitigate the risk of session fixation attacks, it's important that you call
 // RenewToken before making any changes to privilege levels (e.g. login and
@@ -324,18 +392,14 @@ func (s *SessionManager) RenewToken(ctx context.Context) error {
 	sd.mu.Lock()
 	defer sd.mu.Unlock()
 
-	if sd.token != "" {
-		err := s.doStoreDelete(ctx, sd.token)
-		if err != nil {
-			return err
-		}
-	}
-
 	newToken, err := generateToken()
 	if err != nil {
 		return err
 	}
 
+	// Stage the rotation in the request scope. The original token is kept in
+	// originalToken and only removed from the store by Commit after the new
+	// token has been persisted successfully.
 	sd.token = newToken
 	sd.deadline = time.Now().Add(s.Lifetime).UTC()
 	sd.status = Modified
@@ -378,7 +442,12 @@ func (s *SessionManager) MergeSession(ctx context.Context, token string) error {
 	}
 
 	sd.status = Modified
-	return s.doStoreDelete(ctx, token)
+
+	// Stage the removal of the merged-from token. It is only deleted once the
+	// merged data has been committed successfully, so a failed commit never
+	// destroys a session whose data could not be persisted.
+	sd.mergedTokens = append(sd.mergedTokens, token)
+	return nil
 }
 
 // Status returns the current status of the session data.
@@ -585,8 +654,9 @@ func (s *SessionManager) Iterate(ctx context.Context, fn func(context.Context) e
 
 	for token, b := range allSessions {
 		sd := &sessionData{
-			status: Unmodified,
-			token:  token,
+			status:        Unmodified,
+			token:         token,
+			originalToken: token,
 		}
 
 		sd.deadline, sd.values, err = s.Codec.Decode(b)
