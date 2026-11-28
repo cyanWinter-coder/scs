@@ -24,6 +24,7 @@ This project has reached a **stable** status. It is actively maintained with ong
     - [Basic Use](#basic-use)
     - [Configuring Session Behavior](#configuring-session-behavior)
     - [Working with Session Data](#working-with-session-data)
+    - [Rolling Upgrades and Payload Compatibility](#rolling-upgrades-and-payload-compatibility)
     - [Loading and Saving Sessions](#loading-and-saving-sessions)
     - [Configuring the Session Store](#configuring-the-session-store)
     - [Using Custom Session Stores](#using-custom-session-stores)
@@ -139,6 +140,25 @@ Some other useful functions are [`Exists()`](https://pkg.go.dev/github.com/alexe
 Individual data items can be deleted from the session using the [`Remove()`](https://pkg.go.dev/github.com/alexedwards/scs/v2#SessionManager.Remove) method. Alternatively, all session data can be deleted by using the [`Destroy()`](https://pkg.go.dev/github.com/alexedwards/scs/v2#SessionManager.Destroy) method. After calling `Destroy()`, any further operations in the same request cycle will result in a new session being created --- with a new session token and a new lifetime.
 
 Behind the scenes SCS uses gob encoding to store session data, so if you want to store custom types in the session data they must be [registered](https://golang.org/pkg/encoding/gob/#Register) with the encoding/gob package first. Struct fields of custom types must also be exported so that they are visible to the encoding/gob package. Please [see here](https://gist.github.com/alexedwards/d6eca7136f98ec12ad606e774d3abad3) for a working example.
+
+### Rolling Upgrades and Payload Compatibility
+
+The data written to the session store is a versioned *payload*. A payload contains the session deadline, the session values, and a header which identifies its version and protects it with a checksum. Stored session payloads are independent of the session token in the client's cookie: a payload written by a newer instance can be read by an older instance (and vice versa), and an upgrade never forces clients to obtain a new cookie.
+
+Both the legacy payload format and the current format are always accepted when reading. The format written by `GobCodec` is selected with the `WriteLegacy` field:
+
+```go
+sessionManager := scs.New()
+sessionManager.Codec = scs.GobCodec{WriteLegacy: true}
+```
+
+Set `WriteLegacy: true` for the duration of a rolling upgrade, so that instances which have not yet been upgraded can still read the payloads written by upgraded instances. Once every instance runs a version which understands the current format, switch it back to `false` (the default) so that payloads are written deterministically with checksum protection.
+
+If a payload is corrupt, truncated, fails its checksum, or uses a payload version this package does not understand, `Load()` returns an error which matches one of `ErrPayloadTruncated`, `ErrPayloadLengthMismatch`, `ErrPayloadChecksumMismatch`, `ErrPayloadVersionUnsupported`, `ErrPayloadCorrupt` or `ErrPayloadDeadlineInvalid` (test with `errors.Is`). No partially decoded session is returned: the deadline is the zero time and the values are `nil` whenever decoding fails.
+
+A payload which does not carry a deadline — for example one written by a much older version — is given the same default deadline as a new session (`time.Now().Add(Lifetime)`) and written back on the next commit. A payload which carries a deadline that is not a representable time is rejected rather than silently accepted.
+
+If you use a custom `Codec`, the plain `Codec` interface is still supported and the additional payload machinery is bypassed. A custom codec which wants to preserve forward-compatible fields across a decode/encode cycle can implement the `ExtendedCodec` interface instead.
 
 ### Loading and Saving Sessions
 

@@ -34,12 +34,13 @@ const (
 )
 
 type sessionData struct {
-	deadline time.Time
-	expiry   time.Time
-	status   Status
-	token    string
-	values   map[string]interface{}
-	mu       sync.Mutex
+	deadline    time.Time
+	expiry      time.Time
+	status      Status
+	token       string
+	values      map[string]interface{}
+	payloadMeta PayloadMeta
+	mu          sync.Mutex
 }
 
 func newSessionData(lifetime, idleTimeout time.Duration) *sessionData {
@@ -95,9 +96,20 @@ func (s *SessionManager) Load(ctx context.Context, token string) (context.Contex
 		token:  token,
 	}
 
-	sd.deadline, sd.values, err = s.Codec.Decode(b)
+	sd.deadline, sd.values, sd.payloadMeta, err = s.decodePayload(b)
 	if err != nil {
 		return nil, err
+	}
+
+	// A payload written by an older version of the package, or by a codec
+	// which does not carry a deadline, may not contain one. Fill it in using
+	// the same default as a brand new session and mark the session as modified
+	// so that the computed deadline is written back; otherwise a fresh default
+	// would be derived from the current time on every request and the session
+	// would never reach its absolute expiry.
+	if sd.deadline.IsZero() {
+		sd.deadline = time.Now().Add(s.Lifetime).UTC()
+		sd.status = Modified
 	}
 
 	// If the deadline has already passed, do not restore the session. Returning
@@ -142,7 +154,7 @@ func (s *SessionManager) Commit(ctx context.Context) (string, time.Time, error) 
 		}
 	}
 
-	b, err := s.Codec.Encode(sd.deadline, sd.values)
+	b, err := s.encodePayload(sd.deadline, sd.values, sd.payloadMeta)
 	if err != nil {
 		return "", time.Time{}, err
 	}
@@ -178,6 +190,7 @@ func (s *SessionManager) Destroy(ctx context.Context) error {
 	// Reset everything else to defaults.
 	sd.token = ""
 	sd.deadline = time.Now().Add(s.Lifetime).UTC()
+	sd.payloadMeta = PayloadMeta{}
 	for key := range sd.values {
 		delete(sd.values, key)
 	}
@@ -356,7 +369,7 @@ func (s *SessionManager) MergeSession(ctx context.Context, token string) error {
 		return nil
 	}
 
-	deadline, values, err := s.Codec.Decode(b)
+	deadline, values, meta, err := s.decodePayload(b)
 	if err != nil {
 		return err
 	}
@@ -376,6 +389,11 @@ func (s *SessionManager) MergeSession(ctx context.Context, token string) error {
 	for k, v := range values {
 		sd.values[k] = v
 	}
+
+	// Keep any extension fields from the merged payload which the current
+	// session does not already carry, so they are not lost when the merged
+	// session is next committed.
+	mergePayloadExtensions(sd, meta)
 
 	sd.status = Modified
 	return s.doStoreDelete(ctx, token)
@@ -589,10 +607,18 @@ func (s *SessionManager) Iterate(ctx context.Context, fn func(context.Context) e
 			token:  token,
 		}
 
-		sd.deadline, sd.values, err = s.Codec.Decode(b)
+		sd.deadline, sd.values, sd.payloadMeta, err = s.decodePayload(b)
 		if err != nil {
 			return err
 		}
+
+		// Fill in a missing deadline using the same rule as Load so that
+		// sessions written by an older version do not appear to expire
+		// immediately here.
+		if sd.deadline.IsZero() {
+			sd.deadline = time.Now().Add(s.Lifetime).UTC()
+		}
+		sd.expiry = sd.deadline
 
 		ctx = s.addSessionDataToContext(ctx, sd)
 
@@ -674,6 +700,64 @@ func (s *SessionManager) SetToken(ctx context.Context, token string) {
 
 func (s *SessionManager) addSessionDataToContext(ctx context.Context, sd *sessionData) context.Context {
 	return context.WithValue(ctx, s.ContextKey, sd)
+}
+
+// encodePayload encodes a session payload using the configured codec. If the
+// codec implements ExtendedCodec, the payload metadata is passed through so
+// that extension fields survive a decode/encode cycle. Otherwise the plain
+// Codec interface is used and the metadata is ignored.
+func (s *SessionManager) encodePayload(deadline time.Time, values map[string]interface{}, meta PayloadMeta) ([]byte, error) {
+	if c, ok := s.Codec.(ExtendedCodec); ok {
+		return c.EncodePayload(deadline, values, meta)
+	}
+	return s.Codec.Encode(deadline, values)
+}
+
+// decodePayload decodes a session payload using the configured codec. If the
+// codec implements ExtendedCodec, the payload metadata is returned as well. If
+// the codec does not carry payload metadata (for example, a custom codec), the
+// returned metadata describes an unversioned payload with no extensions.
+//
+// An error is returned unchanged and no partial session is produced: the
+// deadline is the zero time and the values are nil whenever err is non-nil.
+func (s *SessionManager) decodePayload(b []byte) (time.Time, map[string]interface{}, PayloadMeta, error) {
+	if c, ok := s.Codec.(ExtendedCodec); ok {
+		deadline, values, meta, err := c.DecodePayload(b)
+		if err != nil {
+			return time.Time{}, nil, PayloadMeta{}, err
+		}
+		if values == nil {
+			values = make(map[string]interface{})
+		}
+		return deadline, values, meta, nil
+	}
+
+	deadline, values, err := s.Codec.Decode(b)
+	if err != nil {
+		return time.Time{}, nil, PayloadMeta{}, err
+	}
+	if values == nil {
+		values = make(map[string]interface{})
+	}
+	return deadline, values, PayloadMeta{}, nil
+}
+
+// mergePayloadExtensions adds extension fields from a merged payload to the
+// current session's payload metadata, without overwriting extensions the
+// current session already has.
+func mergePayloadExtensions(sd *sessionData, meta PayloadMeta) {
+	if len(meta.Extensions) == 0 {
+		return
+	}
+
+	if sd.payloadMeta.Extensions == nil {
+		sd.payloadMeta.Extensions = make(map[string]interface{}, len(meta.Extensions))
+	}
+	for k, v := range meta.Extensions {
+		if _, exists := sd.payloadMeta.Extensions[k]; !exists {
+			sd.payloadMeta.Extensions[k] = v
+		}
+	}
 }
 
 func (s *SessionManager) getSessionDataFromContext(ctx context.Context) *sessionData {
