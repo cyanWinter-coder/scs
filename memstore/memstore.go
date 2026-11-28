@@ -8,6 +8,19 @@ import (
 type item struct {
 	object     []byte
 	expiration int64
+	// version is the store-wide lifecycle version of this entry. It changes on
+	// every Commit (both inserts and renewals), allowing an in-flight cleanup
+	// round to tell a renewed entry apart from the snapshot it captured when
+	// the round began.
+	version uint64
+}
+
+// expiredEntry is a snapshot of a session token that a cleanup round found to
+// be expired when the round started. The version recorded here must still
+// match the live entry when the round comes to delete it.
+type expiredEntry struct {
+	token   string
+	version uint64
 }
 
 // MemStore represents the session store.
@@ -15,6 +28,15 @@ type MemStore struct {
 	items       map[string]item
 	mu          sync.RWMutex
 	stopCleanup chan bool
+	stopOnce    sync.Once
+	// nextVersion is a store-wide monotonic counter. Every Commit assigns the
+	// next value to the entry, so a re-committed token always gets a version
+	// that no previous cleanup round could have captured.
+	nextVersion uint64
+	// stopped is set to true when StopCleanup has terminated the background
+	// cleanup goroutine. Once true, no cleanup round may mutate the items map
+	// anymore.
+	stopped bool
 }
 
 // New returns a new MemStore instance, with a background cleanup goroutine that
@@ -64,9 +86,11 @@ func (m *MemStore) Find(token string) ([]byte, bool, error) {
 // time are updated.
 func (m *MemStore) Commit(token string, b []byte, expiry time.Time) error {
 	m.mu.Lock()
+	m.nextVersion++
 	m.items[token] = item{
 		object:     b,
 		expiration: expiry.UnixNano(),
+		version:    m.nextVersion,
 	}
 	m.mu.Unlock()
 
@@ -102,12 +126,12 @@ func (m *MemStore) All() (map[string][]byte, error) {
 
 func (m *MemStore) startCleanup(interval time.Duration) {
 	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
 	for {
 		select {
 		case <-ticker.C:
 			m.deleteExpired()
 		case <-m.stopCleanup:
-			ticker.Stop()
 			return
 		}
 	}
@@ -123,19 +147,103 @@ func (m *MemStore) startCleanup(interval time.Duration) {
 // scenario, the cleanup goroutine (which will run forever) will prevent the
 // MemStore object from being garbage collected even after the test function
 // has finished. You can prevent this by manually calling StopCleanup.
+//
+// StopCleanup is safe to call multiple times and on instances without a
+// cleanup goroutine; in both cases it is a no-op. After it returns, no further
+// cleanup rounds will run and a late round cannot write back to or delete any
+// entries.
 func (m *MemStore) StopCleanup() {
-	if m.stopCleanup != nil {
-		m.stopCleanup <- true
+	if m.stopCleanup == nil {
+		return
 	}
+
+	m.stopOnce.Do(func() {
+		m.mu.Lock()
+		m.stopped = true
+		m.mu.Unlock()
+
+		close(m.stopCleanup)
+	})
 }
 
-func (m *MemStore) deleteExpired() {
-	now := time.Now().UnixNano()
-	m.mu.Lock()
+// snapshotExpired captures the tokens (and their current lifecycle versions)
+// which are already expired at the instant the cleanup round begins. Entries
+// that are renewed or deleted after this snapshot is taken are not touched by
+// the round, because their versions no longer match.
+func (m *MemStore) snapshotExpired(now int64) []expiredEntry {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	expired := make([]expiredEntry, 0)
 	for token, item := range m.items {
 		if now > item.expiration {
-			delete(m.items, token)
+			expired = append(expired, expiredEntry{
+				token:   token,
+				version: item.version,
+			})
 		}
 	}
-	m.mu.Unlock()
+
+	return expired
+}
+
+// deleteCandidates removes the entries captured at the start of a cleanup
+// round, but only while the store is still running and the live entry still
+// holds the same version and expiration that the snapshot recorded. It
+// returns the number of entries actually deleted.
+func (m *MemStore) deleteCandidates(candidates []expiredEntry, now int64) int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if m.stopped {
+		return 0
+	}
+
+	deleted := 0
+	for _, candidate := range candidates {
+		item, found := m.items[candidate.token]
+		if !found {
+			// The token was already deleted (or recreated under a new
+			// version); the round has no terminal state to produce here.
+			continue
+		}
+
+		if item.version != candidate.version {
+			// The entry was renewed (or deleted and re-committed) after the
+			// round started. The stale round must not touch it.
+			continue
+		}
+
+		// The round only ever removes entries that were already expired when
+		// it began; a version match implies the entry has not been renewed,
+		// and this re-check makes that explicit.
+		if now <= item.expiration {
+			continue
+		}
+
+		delete(m.items, candidate.token)
+		deleted++
+	}
+
+	return deleted
+}
+
+// deleteExpired runs a single cleanup round and returns the number of expired
+// entries that it removed.
+func (m *MemStore) deleteExpired() int {
+	now := time.Now().UnixNano()
+
+	m.mu.RLock()
+	if m.stopped {
+		m.mu.RUnlock()
+		return 0
+	}
+	m.mu.RUnlock()
+
+	candidates := m.snapshotExpired(now)
+	if len(candidates) == 0 {
+		return 0
+	}
+
+	return m.deleteCandidates(candidates, now)
 }
